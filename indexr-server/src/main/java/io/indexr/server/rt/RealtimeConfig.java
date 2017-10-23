@@ -5,6 +5,7 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.databind.jsontype.NamedType;
 import com.fasterxml.jackson.databind.module.SimpleModule;
 
+import io.indexr.server.rt.fetcher.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -17,10 +18,6 @@ import io.indexr.segment.rt.EventIgnoreStrategy;
 import io.indexr.segment.rt.Fetcher;
 import io.indexr.segment.rt.Metric;
 import io.indexr.segment.rt.TagSetting;
-import io.indexr.server.rt.fetcher.ConsoleFetcher;
-import io.indexr.server.rt.fetcher.CsvFetcher;
-import io.indexr.server.rt.fetcher.Kafka08Fetcher;
-import io.indexr.server.rt.fetcher.TestFetcher;
 import io.indexr.util.JsonUtil;
 
 public class RealtimeConfig {
@@ -33,6 +30,8 @@ public class RealtimeConfig {
         fetcherModule
                 .addAbstractTypeMapping(Fetcher.class, Kafka08Fetcher.class)
                 .registerSubtypes(new NamedType(Kafka08Fetcher.class, "kafka-0.8"))
+                .addAbstractTypeMapping(Fetcher.class, NifiFetcher.class)
+                .registerSubtypes(new NamedType(NifiFetcher.class, "nifi"))
                 .addAbstractTypeMapping(Fetcher.class, TestFetcher.class)
                 .registerSubtypes(new NamedType(TestFetcher.class, "test"))
                 .addAbstractTypeMapping(Fetcher.class, ConsoleFetcher.class)
