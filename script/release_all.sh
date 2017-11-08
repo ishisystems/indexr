@@ -13,3 +13,4 @@ bash ${ROOT_DIR}/script/release_indexr-hive.sh
 bash ${ROOT_DIR}/script/release_indexr-spark.sh
 bash ${ROOT_DIR}/script/release_indexr-tool.sh
 bash ${ROOT_DIR}/script/release_lib.sh
+bash ${ROOT_DIR}/script/release_drill_with_indexr.sh
