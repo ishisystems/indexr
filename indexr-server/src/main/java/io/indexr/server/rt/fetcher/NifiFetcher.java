@@ -56,7 +56,7 @@ public class NifiFetcher implements Fetcher {
 
         this.properties = properties;
 
-        logger.info("properties {}",properties);
+//        logger.info("properties {}",properties);
         String urlString = properties.getProperty("nifi.connection.url");
         String portName = properties.getProperty("nifi.connection.portName");
         String requestBatchCount = properties.getProperty("nifi.connection.requestBatchCount");
@@ -67,7 +67,7 @@ public class NifiFetcher implements Fetcher {
 
         this.utf8JsonRowCreator = new UTF8JsonRowCreator(this.numberEmptyAsZero);
         siteToSiteClient = builder.build();
-        logger.info("siteToSiteClient {}", siteToSiteClient);
+//        logger.info("siteToSiteClient {}", siteToSiteClient);
         hasData = false;
         hasNextShouldReturnFalse = false;
     }
@@ -79,7 +79,7 @@ public class NifiFetcher implements Fetcher {
 
     @Override
     public boolean ensure(SegmentSchema schema) throws Exception {
-        logger.info("ensure");
+//        logger.info("ensure");
         this.tableSchema = schema;
         return true;
     }
@@ -95,7 +95,7 @@ public class NifiFetcher implements Fetcher {
             return false;
         }
         transaction.cancel("hasNext");
-        logger.info("hasNext returning true");
+//        logger.info("hasNext returning true");
         return true;
     }
 
@@ -117,12 +117,12 @@ public class NifiFetcher implements Fetcher {
             final byte[] buff = new byte[(int) size];
 
             StreamUtils.fillBuffer(in, buff);
-            logger.info("buff {}", new String(buff));
+//            logger.info("buff {}", new String(buff));
             List<UTF8Row> utf8Rows = parseUTF8Row(buff);
             utf8RowsToReturn.addAll(utf8Rows);
-            logger.info("utf8Rows {}", utf8Rows.size());
+//            logger.info("utf8Rows {}", utf8Rows.size());
         }
-        logger.info("utf8RowsToReturn size {}", utf8RowsToReturn.size());
+//        logger.info("utf8RowsToReturn size {}", utf8RowsToReturn.size());
         return utf8RowsToReturn;
     }
 
@@ -139,13 +139,13 @@ public class NifiFetcher implements Fetcher {
 
     @Override
     public synchronized void close() throws IOException {
-        logger.info("nifi close");
+//        logger.info("nifi close");
         siteToSiteClient.close();
     }
 
     @Override
     public void commit() {
-        logger.info("nifi commit");
+//        logger.info("nifi commit");
         try {
             transaction.confirm();
             transaction.complete();
