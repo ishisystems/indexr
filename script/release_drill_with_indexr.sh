@@ -22,5 +22,6 @@ cd ${TARGET_DIR}/
 cp -r ${RELEASE_PATH} apache-drill-1.11.0/
 rm -f apache-drill-1.11.0/jars/3rdparty/httpclient-4.2.5.jar apache-drill-1.11.0/jars/3rdparty/httpcore-4.2.4.jar
 cp apache-drill-1.11.0/indexr-0.6.1/indexr-drill/jars/3rdparty/* apache-drill-1.11.0/jars/3rdparty/
+cp apache-drill-1.11.0/indexr-0.6.1/indexr-drill/conf/* apache-drill-1.11.0/conf/
 cp_jar ${MAVEN_PATH}/org/apache/drill/contrib/drill-indexr-storage/1.11.0/drill-indexr-storage-1.11.0.jar
 tar -czvf apache-drill-1.11.0.tar.gz apache-drill-1.11.0
