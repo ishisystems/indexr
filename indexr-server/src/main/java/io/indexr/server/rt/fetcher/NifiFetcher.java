@@ -63,6 +63,7 @@ public class NifiFetcher implements Fetcher {
         if (transaction != null) {
             try {
                 TransactionState state = transaction.getState();
+                LOGGER.debug("Stale NiFi transaction in {} state found", state);
                 if (state == TransactionState.TRANSACTION_STARTED || state == TransactionState.DATA_EXCHANGED
                         || state == TransactionState.TRANSACTION_CONFIRMED) {
                     return hasNext();
@@ -83,7 +84,12 @@ public class NifiFetcher implements Fetcher {
         }
         try {
             transaction = siteToSiteClient.createTransaction(TransferDirection.RECEIVE);
-            return hasNext();
+            boolean containsData = hasNext();
+            if (!containsData) { // empty transaction, cancel it right away
+                transaction.cancel("No data contained");
+                transaction = null;
+            }
+            return containsData;
         } catch (Exception e) {
             LOGGER.error("Cannot create or read transaction", e);
             return false;
@@ -141,6 +147,7 @@ public class NifiFetcher implements Fetcher {
                 try {
                     transaction.confirm();
                     transaction.complete();
+                    LOGGER.debug("Transaction successfully commited");
                 } catch (IOException e) {
                     LOGGER.error("Cannot commit transaction", e);
                 }
