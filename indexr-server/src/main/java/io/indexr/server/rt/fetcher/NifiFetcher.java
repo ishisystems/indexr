@@ -31,7 +31,6 @@ public class NifiFetcher implements Fetcher {
 
     private SiteToSiteClient siteToSiteClient;
     private Transaction transaction;
-    private DataPacket dataPacket;
 
     @JsonProperty("number.empty.as.zero")
     public boolean numberEmptyAsZero;
@@ -64,64 +63,84 @@ public class NifiFetcher implements Fetcher {
             try {
                 TransactionState state = transaction.getState();
                 LOGGER.debug("Stale NiFi transaction in {} state found", state);
-                if (state == TransactionState.TRANSACTION_STARTED || state == TransactionState.DATA_EXCHANGED
-                        || state == TransactionState.TRANSACTION_CONFIRMED) {
-                    return hasNext();
+                if (state == TransactionState.TRANSACTION_STARTED || state == TransactionState.DATA_EXCHANGED) {
+                    return true;
                 } else {
+                    try {
+                        transaction.cancel("Wrong transaction state " + state);
+                    } catch (IOException e) {
+                    }
                     transaction = null;
-                    dataPacket = null;
                 }
             } catch (IOException e) {
                 LOGGER.error("Cannot get state of the transaction, closing client", e);
                 IOUtils.closeQuietly(siteToSiteClient);
                 siteToSiteClient = null;
                 transaction = null;
-                dataPacket = null;
             }
         }
         if (siteToSiteClient == null) {
             siteToSiteClient = siteToSiteClientBuilder.build();
         }
-        try {
-            transaction = siteToSiteClient.createTransaction(TransferDirection.RECEIVE);
-            boolean containsData = hasNext();
-            if (!containsData) { // empty transaction, cancel it right away
-                transaction.cancel("No data contained");
-                transaction = null;
+        if (transaction == null) {
+            try {
+                transaction = siteToSiteClient.createTransaction(TransferDirection.RECEIVE);
+            } catch (IOException e) {
+                LOGGER.error("Cannot create transaction", transaction);
+                return false;
             }
-            return containsData;
-        } catch (Exception e) {
-            LOGGER.error("Cannot create or read transaction", e);
-            return false;
         }
+        return true;
     }
 
     @Override
     public boolean hasNext() throws IOException {
-        if (this.dataPacket == null && this.transaction != null) {
-            this.dataPacket = this.transaction.receive();
-        }
-        return this.dataPacket != null;
+        return true;
     }
 
+    /**
+     * Blocking call, similar to Kafka or Console Fetcher, otherwise we create too
+     * many tables.
+     * 
+     * @see io.indexr.segment.rt.Fetcher#next()
+     */
     @Override
-    public List<UTF8Row> next() throws IOException {
-        DataPacket packet = dataPacket;
-        dataPacket = null;
-        return parseUTF8Row(readDataPacket(packet));
+    public List<UTF8Row> next() throws Exception {
+        DataPacket packet = null;
+        while (true) {
+            if (siteToSiteClient == null) {
+                return Collections.emptyList();
+            }
+            if (transaction == null) {
+                transaction = siteToSiteClient.createTransaction(TransferDirection.RECEIVE);
+            }
+            packet = transaction.receive();
+
+            if (packet != null) {
+                break; // parse it
+            } else if (transaction != null) {
+                transaction.confirm();
+                transaction.complete();
+                transaction = null;
+            }
+            Thread.sleep(100);
+        }
+        return parseUTF8Row(packet);
     }
 
-    private byte[] readDataPacket(DataPacket packet) throws IOException {
-        return IOUtils.toByteArray(packet.getData(), packet.getSize()); // we cannot close the stream
-    }
-
-    private List<UTF8Row> parseUTF8Row(byte[] data) {
+    private List<UTF8Row> parseUTF8Row(DataPacket packet) {
         try {
+            byte[] data = IOUtils.toByteArray(packet.getData(), packet.getSize()); // we cannot close the stream
             return utf8JsonRowCreator.create(data);
         } catch (Exception e) {
             LOGGER.debug("Illegal data", e);
             return Collections.emptyList();
         }
+    }
+
+    @Override
+    public void commit() {
+        // no op, as we auto commit transactions inside next() method, similar to kafka
     }
 
     @Override
@@ -133,30 +152,9 @@ public class NifiFetcher implements Fetcher {
                 LOGGER.error("Cannot cancel transaction", e);
             }
             this.transaction = null;
-            this.dataPacket = null;
         }
         IOUtils.closeQuietly(this.siteToSiteClient);
         this.siteToSiteClient = null;
-    }
-
-    @Override
-    public void commit() {
-        // commit only in case we have fully read the transaction
-        try {
-            if (!hasNext()) {
-                try {
-                    transaction.confirm();
-                    transaction.complete();
-                    LOGGER.debug("Transaction successfully commited");
-                } catch (IOException e) {
-                    LOGGER.error("Cannot commit transaction", e);
-                }
-                transaction = null;
-                dataPacket = null;
-            }
-        } catch (IOException e) {
-            LOGGER.warn("Cannot read from transaction", e);
-        }
     }
 
     @Override
