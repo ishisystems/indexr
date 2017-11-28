@@ -10,6 +10,7 @@ import org.apache.nifi.remote.Transaction;
 import org.apache.nifi.remote.Transaction.TransactionState;
 import org.apache.nifi.remote.TransferDirection;
 import org.apache.nifi.remote.client.SiteToSiteClient;
+import org.apache.nifi.remote.exception.TransmissionDisabledException;
 import org.apache.nifi.remote.protocol.DataPacket;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -66,76 +67,95 @@ public class NifiFetcher implements Fetcher {
                 if (state == TransactionState.TRANSACTION_STARTED || state == TransactionState.DATA_EXCHANGED) {
                     return true;
                 } else {
-                    try {
-                        transaction.cancel("Wrong transaction state " + state);
-                    } catch (IOException e) {
-                    }
-                    transaction = null;
+                    cancelTransaction("Wrong transaction state " + state, null);
                 }
             } catch (IOException e) {
-                LOGGER.error("Cannot get state of the transaction, closing client", e);
-                IOUtils.closeQuietly(siteToSiteClient);
-                siteToSiteClient = null;
-                transaction = null;
+                cancelTransaction("Cannot get state of the transaction", e);
             }
         }
         if (siteToSiteClient == null) {
             siteToSiteClient = siteToSiteClientBuilder.build();
         }
-        if (transaction == null) {
-            try {
-                transaction = siteToSiteClient.createTransaction(TransferDirection.RECEIVE);
-            } catch (IOException e) {
-                LOGGER.error("Cannot create transaction", transaction);
-                return false;
-            }
-        }
-        return true;
+        return transaction == null ? createTransaction() : true;
     }
 
     @Override
-    public boolean hasNext() throws IOException {
-        return true;
+    public synchronized boolean hasNext() {
+        return transaction == null ? createTransaction() : true;
     }
 
     /**
-     * Blocking call, similar to Kafka or Console Fetcher, otherwise we create too
-     * many tables.
+     * Blocking call, similar to Kafka or Console Fetcher, otherwise we create too many tables.
+     * 
+     * @throws InterruptedException
+     *             when interrupted
      * 
      * @see io.indexr.segment.rt.Fetcher#next()
      */
     @Override
-    public List<UTF8Row> next() throws Exception {
-        DataPacket packet = null;
+    public List<UTF8Row> next() throws InterruptedException {
+        byte[] data = null;
         while (true) {
-            if (siteToSiteClient == null) {
-                return Collections.emptyList();
-            }
-            if (transaction == null) {
-                transaction = siteToSiteClient.createTransaction(TransferDirection.RECEIVE);
-            }
-            packet = transaction.receive();
+            synchronized (this) {
+                DataPacket packet = null;
+                if (transaction == null && !createTransaction()) {
+                    return Collections.emptyList();
+                }
+                try { // now transaction cannot be null
+                    packet = transaction.receive();
+                    if (packet != null) {
+                        data = IOUtils.toByteArray(packet.getData(), packet.getSize()); // we cannot close the stream
+                        break;
+                    }
+                } catch (IOException | TransmissionDisabledException e) {
+                    cancelTransaction("Cannot receive packet from transaction", e);
+                    return Collections.emptyList();
+                }
 
-            if (packet != null) {
-                break; // parse it
-            } else if (transaction != null) {
-                transaction.confirm();
-                transaction.complete();
-                transaction = null;
+                try { // no new packet received
+                    transaction.confirm();
+                    transaction.complete();
+                    transaction = null;
+                } catch (IOException e) {
+                    cancelTransaction("Cannot commit transaction", e);
+                    return Collections.emptyList();
+                }
             }
             Thread.sleep(100);
         }
-        return parseUTF8Row(packet);
-    }
-
-    private List<UTF8Row> parseUTF8Row(DataPacket packet) {
+        // finally we have some data to process
         try {
-            byte[] data = IOUtils.toByteArray(packet.getData(), packet.getSize()); // we cannot close the stream
             return utf8JsonRowCreator.create(data);
         } catch (Exception e) {
             LOGGER.debug("Illegal data", e);
-            return Collections.emptyList();
         }
+        return Collections.emptyList();
+    }
+
+    private boolean createTransaction() {
+        if (siteToSiteClient == null) {
+            return false;
+        }
+        try {
+            transaction = siteToSiteClient.createTransaction(TransferDirection.RECEIVE);
+            return true;
+        } catch (IOException e) {
+            LOGGER.error("Cannot create transaction", e);
+            return false;
+        }
+    }
+
+    private void cancelTransaction(String msg, Exception ex) {
+        if (transaction == null) {
+            return;
+        }
+        LOGGER.error(msg, ex);
+        try {
+            transaction.cancel(msg);
+        } catch (Exception e) {
+            LOGGER.debug("Cannot cancel transaction", e);
+        }
+        transaction = null;
     }
 
     @Override
@@ -145,14 +165,7 @@ public class NifiFetcher implements Fetcher {
 
     @Override
     public synchronized void close() throws IOException {
-        if (this.transaction != null) {
-            try {
-                this.transaction.cancel("Closing the Fetcher");
-            } catch (Exception e) {
-                LOGGER.error("Cannot cancel transaction", e);
-            }
-            this.transaction = null;
-        }
+        cancelTransaction("Closing the Fetcher", null);
         IOUtils.closeQuietly(this.siteToSiteClient);
         this.siteToSiteClient = null;
     }
