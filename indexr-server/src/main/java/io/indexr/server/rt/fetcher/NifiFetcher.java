@@ -3,6 +3,7 @@ package io.indexr.server.rt.fetcher;
 import java.io.IOException;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Properties;
 
 import org.apache.commons.io.IOUtils;
@@ -28,9 +29,11 @@ public class NifiFetcher implements Fetcher {
 	private static final Logger LOGGER = LoggerFactory.getLogger(NifiFetcher.class);
 
 	private final SiteToSiteClient.Builder siteToSiteClientBuilder;
+	private final SiteToSiteClient.Builder invalidSiteToSiteClientBuilder;
 	private final UTF8JsonRowCreator utf8JsonRowCreator;
 
 	private SiteToSiteClient siteToSiteClient;
+	private SiteToSiteClient invalidSiteToSiteClient;
 	private Transaction transaction;
 
 	@JsonProperty("number.empty.as.zero")
@@ -46,10 +49,18 @@ public class NifiFetcher implements Fetcher {
 		String urlString = properties.getProperty("nifi.connection.url");
 		String portName = properties.getProperty("nifi.connection.portName");
 		String requestBatchCount = properties.getProperty("nifi.connection.requestBatchCount");
+		String invalidPortName = properties.getProperty("nifi.connection.invalidPortName");
 		this.siteToSiteClientBuilder = new SiteToSiteClient.Builder();
 		this.siteToSiteClientBuilder.url(urlString);
 		this.siteToSiteClientBuilder.portName(portName);
 		this.siteToSiteClientBuilder.requestBatchCount(Integer.valueOf(requestBatchCount));
+		if (invalidPortName != null) {
+			this.invalidSiteToSiteClientBuilder = new SiteToSiteClient.Builder();
+			invalidSiteToSiteClientBuilder.fromConfig(this.siteToSiteClientBuilder.buildConfig());
+			invalidSiteToSiteClientBuilder.portName(invalidPortName);
+		} else {
+			this.invalidSiteToSiteClientBuilder = null;
+		}
 		this.utf8JsonRowCreator = new UTF8JsonRowCreator(this.numberEmptyAsZero);
 	}
 
@@ -76,6 +87,9 @@ public class NifiFetcher implements Fetcher {
 		if (siteToSiteClient == null) {
 			siteToSiteClient = siteToSiteClientBuilder.build();
 		}
+		if (invalidSiteToSiteClient == null && invalidSiteToSiteClientBuilder != null) {
+			invalidSiteToSiteClient = invalidSiteToSiteClientBuilder.build();
+		}
 		return transaction == null ? createTransaction() : true;
 	}
 
@@ -95,6 +109,7 @@ public class NifiFetcher implements Fetcher {
 	@Override
 	public List<UTF8Row> next() throws InterruptedException {
 		byte[] data = null;
+		Map<String, String> attributes = null;
 		while (true) {
 			synchronized (this) {
 				DataPacket packet = null;
@@ -105,6 +120,7 @@ public class NifiFetcher implements Fetcher {
 					packet = transaction.receive();
 					if (packet != null) {
 						data = IOUtils.toByteArray(packet.getData(), packet.getSize()); // we cannot close the stream
+						attributes = packet.getAttributes();
 						break;
 					}
 				} catch (IOException | TransmissionDisabledException e) {
@@ -125,11 +141,37 @@ public class NifiFetcher implements Fetcher {
 		}
 		// finally we have some data to process
 		try {
-			return utf8JsonRowCreator.create(data);
+			synchronized (utf8JsonRowCreator) {
+				long failed = utf8JsonRowCreator.getFailCount();
+				List<UTF8Row> rows = utf8JsonRowCreator.create(data);
+				if (utf8JsonRowCreator.getFailCount() <= failed) {
+					return rows;
+				}
+			}
+			// invalid data were already reported inside utf8JsonRowCreator
 		} catch (Exception e) {
-			LOGGER.debug("Illegal data", e);
+			LOGGER.debug("Illegal data", e); // some parsing exception, maybe wrong charset?
+		}
+		try {
+			reportInvalidData(data, attributes);
+		} catch (Exception e) {
+			cancelTransaction("Cannot report invalid data back to NiFi", e);
 		}
 		return Collections.emptyList();
+	}
+
+	private void reportInvalidData(final byte[] data, final Map<String, String> attributes) throws IOException {
+		if (this.invalidSiteToSiteClient == null) {
+			return;
+		}
+		Transaction sendTransaction = this.invalidSiteToSiteClient.createTransaction(TransferDirection.SEND);
+		if (sendTransaction == null) {
+			cancelTransaction("Cannot report invalid data back to NiFi as sending transaction is null", null);
+			return;
+		}
+		sendTransaction.send(data, attributes);
+		sendTransaction.confirm();
+		sendTransaction.complete();
 	}
 
 	private boolean createTransaction() {
@@ -168,6 +210,7 @@ public class NifiFetcher implements Fetcher {
 		cancelTransaction("Closing the Fetcher", null);
 		IOUtils.closeQuietly(this.siteToSiteClient);
 		this.siteToSiteClient = null;
+		this.invalidSiteToSiteClient = null;
 	}
 
 	@Override
