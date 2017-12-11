@@ -8,7 +8,6 @@ import java.util.Properties;
 
 import org.apache.commons.io.IOUtils;
 import org.apache.nifi.remote.Transaction;
-import org.apache.nifi.remote.Transaction.TransactionState;
 import org.apache.nifi.remote.TransferDirection;
 import org.apache.nifi.remote.client.SiteToSiteClient;
 import org.apache.nifi.remote.exception.TransmissionDisabledException;
@@ -35,6 +34,8 @@ public class NifiFetcher implements Fetcher {
 	private SiteToSiteClient siteToSiteClient;
 	private SiteToSiteClient invalidSiteToSiteClient;
 	private Transaction transaction;
+	private boolean transactionDone;
+	private boolean emptyTransaction;
 
 	@JsonProperty("number.empty.as.zero")
 	public boolean numberEmptyAsZero;
@@ -72,17 +73,7 @@ public class NifiFetcher implements Fetcher {
 	@Override
 	public synchronized boolean ensure(SegmentSchema schema) {
 		if (transaction != null) {
-			try {
-				TransactionState state = transaction.getState();
-				LOGGER.debug("Stale NiFi transaction in {} state found", state);
-				if (state == TransactionState.TRANSACTION_STARTED || state == TransactionState.DATA_EXCHANGED) {
-					return true;
-				} else {
-					cancelTransaction("Wrong transaction state " + state, null);
-				}
-			} catch (IOException e) {
-				cancelTransaction("Cannot get state of the transaction", e);
-			}
+			cancelTransaction("Old uncommitted transaction", null);
 		}
 		if (siteToSiteClient == null) {
 			siteToSiteClient = siteToSiteClientBuilder.build();
@@ -90,54 +81,45 @@ public class NifiFetcher implements Fetcher {
 		if (invalidSiteToSiteClient == null && invalidSiteToSiteClientBuilder != null) {
 			invalidSiteToSiteClient = invalidSiteToSiteClientBuilder.build();
 		}
-		return transaction == null ? createTransaction() : true;
+		return createTransaction();
 	}
 
 	@Override
 	public synchronized boolean hasNext() {
-		return transaction == null ? createTransaction() : true;
+		return transaction != null && !transactionDone;
 	}
 
-	/**
-	 * Blocking call, similar to Kafka or Console Fetcher, otherwise we create too many tables.
-	 * 
-	 * @throws InterruptedException
-	 *             when interrupted
-	 * 
-	 * @see io.indexr.segment.rt.Fetcher#next()
-	 */
 	@Override
 	public List<UTF8Row> next() throws InterruptedException {
 		byte[] data = null;
 		Map<String, String> attributes = null;
-		while (true) {
+		while (data == null) { // skip all empty transaction until we get some with data
 			synchronized (this) {
-				DataPacket packet = null;
-				if (transaction == null && !createTransaction()) {
+				if (transaction == null) {
 					return Collections.emptyList();
 				}
-				try { // now transaction cannot be null
+				DataPacket packet = null;
+				try {
 					packet = transaction.receive();
 					if (packet != null) {
+						emptyTransaction = false;
 						data = IOUtils.toByteArray(packet.getData(), packet.getSize()); // we cannot close the stream
 						attributes = packet.getAttributes();
-						break;
+					} else if (emptyTransaction) {
+						cancelTransaction("Empty transaction", null);
+						if (!createTransaction()) {
+							return Collections.emptyList();
+						}
+						Thread.sleep(100);
+					} else {
+						transactionDone = true; // transaction done, hasNext() will return false
+						return Collections.emptyList();
 					}
 				} catch (IOException | TransmissionDisabledException e) {
 					cancelTransaction("Cannot receive packet from transaction", e);
 					return Collections.emptyList();
 				}
-
-				try { // no new packet received
-					transaction.confirm();
-					transaction.complete();
-					transaction = null;
-				} catch (IOException e) {
-					cancelTransaction("Cannot commit transaction", e);
-					return Collections.emptyList();
-				}
 			}
-			Thread.sleep(100);
 		}
 		// finally we have some data to process
 		try {
@@ -180,6 +162,8 @@ public class NifiFetcher implements Fetcher {
 		}
 		try {
 			transaction = siteToSiteClient.createTransaction(TransferDirection.RECEIVE);
+			transactionDone = false;
+			emptyTransaction = true;
 			return transaction != null;
 		} catch (IOException e) {
 			LOGGER.error("Cannot create transaction", e);
@@ -201,8 +185,18 @@ public class NifiFetcher implements Fetcher {
 	}
 
 	@Override
-	public void commit() {
-		// no op, as we auto commit transactions inside next() method, similar to kafka
+	public synchronized void commit() throws IOException {
+		if (transaction == null) {
+			return;
+		}
+		try {
+			transaction.confirm();
+			transaction.complete();
+			transaction = null;
+		} catch (Exception e) {
+			cancelTransaction("Cannot commit transaction", e);
+			throw e;
+		}
 	}
 
 	@Override
