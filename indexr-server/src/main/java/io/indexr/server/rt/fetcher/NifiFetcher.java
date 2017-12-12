@@ -1,6 +1,7 @@
 package io.indexr.server.rt.fetcher;
 
 import java.io.IOException;
+import java.net.ConnectException;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -8,9 +9,12 @@ import java.util.Properties;
 
 import org.apache.commons.io.IOUtils;
 import org.apache.nifi.remote.Transaction;
+import org.apache.nifi.remote.Transaction.TransactionState;
 import org.apache.nifi.remote.TransferDirection;
 import org.apache.nifi.remote.client.SiteToSiteClient;
+import org.apache.nifi.remote.exception.PortNotRunningException;
 import org.apache.nifi.remote.exception.TransmissionDisabledException;
+import org.apache.nifi.remote.exception.UnknownPortException;
 import org.apache.nifi.remote.protocol.DataPacket;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -73,7 +77,17 @@ public class NifiFetcher implements Fetcher {
 	@Override
 	public synchronized boolean ensure(SegmentSchema schema) {
 		if (transaction != null) {
-			cancelTransaction("Old uncommitted transaction", null);
+			try {
+				TransactionState state = transaction.getState();
+				LOGGER.debug("Stale NiFi transaction in {} state found", state);
+				if (state == TransactionState.TRANSACTION_STARTED || state == TransactionState.DATA_EXCHANGED) {
+					return true;
+				} else {
+					cancelTransaction("Wrong transaction state " + state, null);
+				}
+			} catch (IOException e) {
+				cancelTransaction("Cannot get state of the transaction", e);
+			}
 		}
 		if (siteToSiteClient == null) {
 			siteToSiteClient = siteToSiteClientBuilder.build();
@@ -81,7 +95,7 @@ public class NifiFetcher implements Fetcher {
 		if (invalidSiteToSiteClient == null && invalidSiteToSiteClientBuilder != null) {
 			invalidSiteToSiteClient = invalidSiteToSiteClientBuilder.build();
 		}
-		return createTransaction();
+		return transaction == null ? createTransaction() : true;
 	}
 
 	@Override
@@ -106,10 +120,10 @@ public class NifiFetcher implements Fetcher {
 						data = IOUtils.toByteArray(packet.getData(), packet.getSize()); // we cannot close the stream
 						attributes = packet.getAttributes();
 					} else if (emptyTransaction) {
-						cancelTransaction("Empty transaction", null);
-						if (!createTransaction()) {
-							return Collections.emptyList();
-						}
+						transaction.confirm();
+						transaction.complete();
+						transaction = null;
+						createTransaction();
 						Thread.sleep(100);
 					} else {
 						transactionDone = true; // transaction done, hasNext() will return false
@@ -165,6 +179,9 @@ public class NifiFetcher implements Fetcher {
 			transactionDone = false;
 			emptyTransaction = true;
 			return transaction != null;
+		} catch (ConnectException | PortNotRunningException | UnknownPortException e) {
+			LOGGER.error("Cannot create transaction: {}", e.toString());
+			return false;
 		} catch (IOException e) {
 			LOGGER.error("Cannot create transaction", e);
 			return false;
@@ -186,7 +203,9 @@ public class NifiFetcher implements Fetcher {
 
 	@Override
 	public synchronized void commit() throws IOException {
-		if (transaction == null) {
+		// we can commit only full transaction, when not done, it will be committed
+		// during next iteration
+		if (transaction == null || !transactionDone) {
 			return;
 		}
 		try {
